@@ -1,10 +1,15 @@
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
+use bytes::BytesMut;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use maboroshi_core::{
     AsyncStream, Error, Obfuscator, PluggableTransport, PtClientInstance, PtConfig,
     PtServerInstance, Result, TransportType,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::Message;
@@ -203,27 +208,179 @@ pub struct WebTunnelObfuscator {
     pub ws_url: String,
 }
 
+/// Adapter that delegates `AsyncRead`/`AsyncWrite` to a boxed `AsyncStream`.
+///
+/// `tokio-tungstenite` needs a concrete type implementing both async I/O
+/// traits; this thin wrapper satisfies that requirement.
+struct StreamAdapter {
+    inner: Box<dyn AsyncStream>,
+}
+
+impl AsyncRead for StreamAdapter {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for StreamAdapter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Unpin for StreamAdapter {}
+
+/// Wraps a `WebSocketStream` into an `AsyncRead + AsyncWrite` byte stream.
+///
+/// Incoming WebSocket binary frames are reassembled into a contiguous byte
+/// stream. Writes are sent as binary frames.
+struct WsStream<S> {
+    inner: tokio_tungstenite::WebSocketStream<S>,
+    /// Leftover bytes from the last received frame that have not yet been
+    /// consumed by a `poll_read` call.
+    read_buf: BytesMut,
+}
+
+impl<S> WsStream<S> {
+    fn new(inner: tokio_tungstenite::WebSocketStream<S>) -> Self {
+        Self {
+            inner,
+            read_buf: BytesMut::new(),
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Unpin for WsStream<S> {}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        // Return buffered data first.
+        if !this.read_buf.is_empty() {
+            let len = this.read_buf.len().min(buf.remaining());
+            buf.put_slice(&this.read_buf.split_to(len));
+            return Poll::Ready(Ok(()));
+        }
+
+        // Poll the WebSocket stream for the next frame.
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(Message::Binary(data)))) => {
+                let len = data.len().min(buf.remaining());
+                buf.put_slice(&data[..len]);
+                if len < data.len() {
+                    this.read_buf.extend_from_slice(&data[len..]);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Ok(Message::Close(_)))) | Poll::Ready(None) => {
+                // EOF
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Ok(_))) => {
+                // Skip non-binary frames and try again.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let msg = Message::Binary(buf.to_vec().into());
+        match Pin::new(&mut this.inner).poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                match Pin::new(&mut this.inner).start_send(msg) {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner)
+            .poll_flush(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner)
+            .poll_close(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+}
+
 #[async_trait]
 impl Obfuscator for WebTunnelObfuscator {
     async fn wrap(
         &self,
         stream: Box<dyn AsyncStream>,
     ) -> Result<Box<dyn AsyncStream>> {
-        // Perform a WebSocket upgrade over the provided stream.
-        // The upgraded stream is returned as the obfuscated transport.
-        let _key = generate_key();
+        let uri: tokio_tungstenite::tungstenite::http::Uri = self
+            .ws_url
+            .parse()
+            .map_err(|e| Error::Config(format!("invalid WebSocket URL: {e}")))?;
 
-        // For now, pass the stream through. A full implementation would
-        // perform the WebSocket framing over the existing stream.
-        // This stub satisfies the trait contract and is the integration point
-        // for real WebSocket framing.
-        Ok(stream)
+        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("Host", uri.authority().map_or("localhost", |a| a.as_str()))
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Key", generate_key())
+            .header("Sec-WebSocket-Version", "13")
+            .body(())
+            .map_err(|e| Error::Transport(format!("failed to build upgrade request: {e}")))?;
+
+        let adapter = StreamAdapter { inner: stream };
+        let (ws_stream, _response) =
+            tokio_tungstenite::client_async(request, adapter)
+                .await
+                .map_err(|e| Error::Handshake(format!("WebSocket handshake failed: {e}")))?;
+
+        Ok(Box::new(WsStream::new(ws_stream)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]
     fn name_is_webtunnel() {
@@ -243,5 +400,52 @@ mod tests {
             ws_url: "ws://127.0.0.1:8080/tunnel".into(),
         };
         assert_eq!(o.ws_url, "ws://127.0.0.1:8080/tunnel");
+    }
+
+    #[test]
+    fn stream_adapter_is_unpin() {
+        fn assert_unpin<T: Unpin>() {}
+        assert_unpin::<StreamAdapter>();
+    }
+
+    #[tokio::test]
+    async fn wrap_performs_websocket_handshake() {
+        // Start a minimal WebSocket echo server.
+        let ws_listener =
+            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = ws_listener.accept().await {
+                if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                    let (mut write, mut read) = ws.split();
+                    while let Some(Ok(msg)) = read.next().await {
+                        if msg.is_binary() {
+                            let _ = write.send(msg).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Connect a raw TCP stream to the WS server.
+        let tcp = tokio::net::TcpStream::connect(ws_addr).await.unwrap();
+        let stream: Box<dyn AsyncStream> = Box::new(tcp);
+
+        let obfuscator = WebTunnelObfuscator {
+            ws_url: format!("ws://{ws_addr}/"),
+        };
+
+        let mut wrapped = obfuscator.wrap(stream).await.unwrap();
+
+        // Round-trip some data through the WebSocket layer.
+        wrapped.write_all(b"hello").await.unwrap();
+        wrapped.flush().await.unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = wrapped.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
     }
 }

@@ -16,11 +16,15 @@ maboroshi-core = { path = "../maboroshi-core" }
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
+hmac = "0.12"
+rand = "0.8"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
 tracing = "0.1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

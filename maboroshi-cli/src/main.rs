@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
 use maboroshi_core::{PluggableTransport, PtConfig, TransportType};
-use maboroshi_transports::{PlainTransport, WebTunnelTransport};
+use maboroshi_transports::{Obfs4Transport, PlainTransport, WebTunnelTransport};
 use tracing::info;
 
 #[derive(Parser)]
@@ -56,6 +56,7 @@ fn transport_for(name: &str) -> Result<Box<dyn PluggableTransport>, String> {
     match name {
         "plain" => Ok(Box::new(PlainTransport::new())),
         "webtunnel" => Ok(Box::new(WebTunnelTransport::new())),
+        "obfs4" => Ok(Box::new(Obfs4Transport::new([0u8; 20], [0u8; 32]))),
         other => Err(format!("unknown transport: {other}")),
     }
 }
@@ -64,6 +65,7 @@ fn available_transports() -> Vec<(&'static str, TransportType)> {
     vec![
         ("plain", TransportType::Plain),
         ("webtunnel", TransportType::WebTunnel),
+        ("obfs4", TransportType::Obfs4),
     ]
 }
 
