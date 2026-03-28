@@ -3,6 +3,8 @@
 Pure Rust implementation of Tor's Pluggable Transport IPC protocol with
 obfuscation layers for censorship-resistant tunneling.
 
+**Tests:** 87
+
 ## Architecture
 
 ```
@@ -16,6 +18,17 @@ maboroshi-cli         CLI binary (client, server, list subcommands)
 - `PluggableTransport` — async start_client / start_server, name, transport_type
 - `Obfuscator` — wrap a raw async stream into an obfuscated one
 
+### Key Types
+
+| Type | Kind | Description |
+|------|------|-------------|
+| `PtState` | Enum | 7 lifecycle states for transport processes |
+| `ObfuscationLevel` | Enum | None / Moderate / Paranoid |
+| `TransportMode` | Enum | Client / Server |
+| `TransportStatus` | Struct | Runtime status of a transport instance |
+| `MockPluggableTransport` | Struct | Deterministic transport for testing |
+| `Error` | Struct | Clone + PartialEq + is_retryable() |
+
 ### Transports
 
 | Transport | Status | Description |
@@ -28,10 +41,10 @@ maboroshi-cli         CLI binary (client, server, list subcommands)
 
 | Path | Purpose |
 |------|---------|
-| `maboroshi-core/src/lib.rs` | Core traits, error types, config structs |
+| `maboroshi-core/src/lib.rs` | Core traits, error types, config structs, PtState, ObfuscationLevel, TransportMode, TransportStatus |
 | `maboroshi-transports/src/plain.rs` | Plain TCP transport implementation |
 | `maboroshi-transports/src/webtunnel.rs` | WebTunnel transport + obfuscator |
-| `maboroshi-cli/src/main.rs` | CLI entry point with clap subcommands |
+| `maboroshi-cli/src/main.rs` | CLI entry point with clap subcommands, execute() extracted for testability |
 | `flake.nix` | Nix build (substrate workspace builder) |
 
 ## Build Commands
@@ -55,7 +68,7 @@ nix build                      # Nix hermetic build
 - shikumi for configuration
 - async-trait + tokio for async runtime
 - thiserror 2 for error types
-- tracing for structured logging
+- tracing for structured logging (replaced silenced errors with tracing::debug)
 
 ## Adding a New Transport
 

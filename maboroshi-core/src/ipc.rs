@@ -7,7 +7,7 @@ use std::path::PathBuf;
 ///
 /// The PT spec requires managed transports to read configuration from
 /// `TOR_PT_*` environment variables and report status back via stdout.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtEnvironment {
     /// Directory for persistent state (`TOR_PT_STATE_LOCATION`).
     pub state_location: PathBuf,
@@ -128,7 +128,7 @@ fn parse_bindaddr(value: &str) -> Result<HashMap<String, SocketAddr>, PtEnvError
 }
 
 /// Errors from parsing the PT environment.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PtEnvError {
     #[error("missing required environment variable: {0}")]
     MissingVar(&'static str),
@@ -138,6 +138,15 @@ pub enum PtEnvError {
 
     #[error("invalid TOR_PT_SERVER_BINDADDR entry: {0}")]
     InvalidBindAddr(String),
+}
+
+impl PtEnvError {
+    /// Returns `true` for transient errors that may succeed on retry.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        // Environment errors are configuration issues, not transient.
+        false
+    }
 }
 
 /// Protocol reporter that writes PT IPC status lines.
@@ -152,11 +161,13 @@ pub struct PtReporter<W: Write> {
 
 impl<W: Write> PtReporter<W> {
     /// Create a new reporter writing to the given writer.
+    #[must_use]
     pub fn new(writer: W) -> Self {
         Self { writer }
     }
 
     /// Consume the reporter and return the inner writer.
+    #[must_use]
     pub fn into_inner(self) -> W {
         self.writer
     }
@@ -390,6 +401,89 @@ mod tests {
         assert_eq!(
             output,
             "VERSION 1\nCMETHOD obfs4 socks5 127.0.0.1:9050\nCMETHODS DONE\n"
+        );
+    }
+
+    #[test]
+    fn report_cmethod_error() {
+        let mut reporter = PtReporter::new(Vec::new());
+        reporter.cmethod_error("obfs4", "bind failed").unwrap();
+        let buf = reporter.into_inner();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "CMETHOD-ERROR obfs4 bind failed\n"
+        );
+    }
+
+    #[test]
+    fn report_smethod_error() {
+        let mut reporter = PtReporter::new(Vec::new());
+        reporter.smethod_error("obfs4", "bind failed").unwrap();
+        let buf = reporter.into_inner();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "SMETHOD-ERROR obfs4 bind failed\n"
+        );
+    }
+
+    // --- PtEnvError tests ---
+
+    #[test]
+    fn pt_env_error_display() {
+        assert_eq!(
+            PtEnvError::MissingVar("TOR_PT_STATE_LOCATION").to_string(),
+            "missing required environment variable: TOR_PT_STATE_LOCATION"
+        );
+        assert_eq!(
+            PtEnvError::InvalidAddr("TOR_PT_ORPORT", "bad".into()).to_string(),
+            "invalid address in TOR_PT_ORPORT: bad"
+        );
+        assert_eq!(
+            PtEnvError::InvalidBindAddr("bad-entry".into()).to_string(),
+            "invalid TOR_PT_SERVER_BINDADDR entry: bad-entry"
+        );
+    }
+
+    #[test]
+    fn pt_env_error_clone_eq() {
+        let e1 = PtEnvError::MissingVar("TOR_PT_STATE_LOCATION");
+        let e2 = e1.clone();
+        assert_eq!(e1, e2);
+    }
+
+    #[test]
+    fn pt_env_error_not_retryable() {
+        assert!(!PtEnvError::MissingVar("X").is_retryable());
+        assert!(!PtEnvError::InvalidAddr("X", "bad".into()).is_retryable());
+        assert!(!PtEnvError::InvalidBindAddr("bad".into()).is_retryable());
+    }
+
+    // --- PtEnvironment equality ---
+
+    #[test]
+    fn pt_environment_clone_eq() {
+        let mut map = HashMap::new();
+        map.insert("TOR_PT_STATE_LOCATION", "/tmp/state");
+        map.insert("TOR_PT_MANAGED_TRANSPORT_VER", "1");
+        map.insert("TOR_PT_CLIENT_TRANSPORTS", "plain");
+
+        let env = env_from_map(&map).unwrap();
+        let env2 = env.clone();
+        assert_eq!(env, env2);
+    }
+
+    #[test]
+    fn report_full_server_sequence() {
+        let addr: SocketAddr = "0.0.0.0:9443".parse().unwrap();
+        let mut reporter = PtReporter::new(Vec::new());
+        reporter.version("1").unwrap();
+        reporter.smethod("obfs4", &addr).unwrap();
+        reporter.smethods_done().unwrap();
+        let buf = reporter.into_inner();
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            output,
+            "VERSION 1\nSMETHOD obfs4 0.0.0.0:9443\nSMETHODS DONE\n"
         );
     }
 }

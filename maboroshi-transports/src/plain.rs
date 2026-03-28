@@ -9,6 +9,7 @@ use tracing::info;
 ///
 /// Provides a baseline implementation with no obfuscation — useful for
 /// testing and as a reference for implementing new transports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlainTransport;
 
 impl PlainTransport {
@@ -53,10 +54,12 @@ impl PluggableTransport for PlainTransport {
                                 Ok(mut outbound) => {
                                     let (mut ri, mut wi) = inbound.split();
                                     let (mut ro, mut wo) = outbound.split();
-                                    let _ = tokio::try_join!(
+                                    if let Err(e) = tokio::try_join!(
                                         tokio::io::copy(&mut ri, &mut wo),
                                         tokio::io::copy(&mut ro, &mut wi),
-                                    );
+                                    ) {
+                                        tracing::debug!(%e, "plain: copy loop ended");
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!(%e, "plain: failed to connect to target");
@@ -94,10 +97,12 @@ impl PluggableTransport for PlainTransport {
                                 Ok(mut outbound) => {
                                     let (mut ri, mut wi) = inbound.split();
                                     let (mut ro, mut wo) = outbound.split();
-                                    let _ = tokio::try_join!(
+                                    if let Err(e) = tokio::try_join!(
                                         tokio::io::copy(&mut ri, &mut wo),
                                         tokio::io::copy(&mut ro, &mut wi),
-                                    );
+                                    ) {
+                                        tracing::debug!(%e, "plain: copy loop ended");
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!(%e, "plain: failed to connect to target");
@@ -199,5 +204,18 @@ mod tests {
         let mut buf = vec![0u8; 16];
         let n = conn.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn plain_transport_clone_eq() {
+        let t1 = PlainTransport::new();
+        let t2 = t1;
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn plain_transport_default() {
+        let t = PlainTransport::default();
+        assert_eq!(t, PlainTransport::new());
     }
 }

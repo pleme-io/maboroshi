@@ -22,6 +22,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// XOR encryption. The Elligator2 representative is simplified (high-bit
 /// clearing) — a full implementation would use the actual Elligator2
 /// bijection for uniform-random key images.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Obfs4Transport {
     /// Server node ID (20-byte identity).
     pub node_id: [u8; 20],
@@ -80,10 +81,12 @@ impl PluggableTransport for Obfs4Transport {
                                         Ok(wrapped) => {
                                             let (mut ri, mut wi) = inbound.split();
                                             let (mut ro, mut wo) = tokio::io::split(wrapped);
-                                            let _ = tokio::try_join!(
+                                            if let Err(e) = tokio::try_join!(
                                                 tokio::io::copy(&mut ri, &mut wo),
                                                 tokio::io::copy(&mut ro, &mut wi),
-                                            );
+                                            ) {
+                                                tracing::debug!(%e, "obfs4 client: copy loop ended");
+                                            }
                                         }
                                         Err(e) => {
                                             tracing::error!(%e, "obfs4: handshake failed");
@@ -126,10 +129,12 @@ impl PluggableTransport for Obfs4Transport {
                                 Ok(mut outbound) => {
                                     let (mut ri, mut wi) = inbound.split();
                                     let (mut ro, mut wo) = outbound.split();
-                                    let _ = tokio::try_join!(
+                                    if let Err(e) = tokio::try_join!(
                                         tokio::io::copy(&mut ri, &mut wo),
                                         tokio::io::copy(&mut ro, &mut wi),
-                                    );
+                                    ) {
+                                        tracing::debug!(%e, "obfs4: copy loop ended");
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!(%e, "obfs4: failed to connect to target");
@@ -156,6 +161,7 @@ impl PluggableTransport for Obfs4Transport {
 /// Performs an ntor-like X25519 handshake and then applies XOR stream
 /// encryption with the derived shared secret. A production implementation
 /// would use AES-256-CTR; the XOR cipher is a placeholder marked with TODO.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Obfs4Obfuscator {
     /// Server's 20-byte node ID.
     pub node_id: [u8; 20],
@@ -350,7 +356,7 @@ impl Obfuscator for Obfs4Obfuscator {
         // 5. Derive shared secret via X25519.
         let shared_secret = handshake.derive_shared_secret();
 
-        // 6. Return XOR-encrypted stream (TODO: replace with AES-256-CTR).
+        // 6. Return XOR-encrypted stream (placeholder; production would use AES-256-CTR).
         Ok(Box::new(XorStream::new(stream, shared_secret)))
     }
 }
@@ -529,6 +535,23 @@ mod tests {
 
         // Clean up.
         drop(result);
-        let _ = server_handle.await;
+        server_handle.await.expect("server task should complete");
+    }
+
+    #[test]
+    fn obfs4_transport_clone_eq() {
+        let t1 = Obfs4Transport::new([0xAAu8; 20], [0xBBu8; 32]);
+        let t2 = t1.clone();
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn obfs4_obfuscator_clone_eq() {
+        let o1 = Obfs4Obfuscator {
+            node_id: [0x42u8; 20],
+            public_key: [0x13u8; 32],
+        };
+        let o2 = o1.clone();
+        assert_eq!(o1, o2);
     }
 }

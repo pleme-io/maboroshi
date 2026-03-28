@@ -19,6 +19,7 @@ use tracing::info;
 ///
 /// Wraps TCP connections inside a WebSocket upgrade so traffic looks
 /// like ordinary HTTPS/WebSocket traffic to network observers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebTunnelTransport;
 
 impl WebTunnelTransport {
@@ -72,7 +73,7 @@ impl PluggableTransport for WebTunnelTransport {
                                     let (mut tcp_read, mut tcp_write) =
                                         tokio::io::split(inbound);
 
-                                    let _ = tokio::try_join!(
+                                    if let Err(e) = tokio::try_join!(
                                         async {
                                             let mut buf = vec![0u8; 4096];
                                             loop {
@@ -98,7 +99,9 @@ impl PluggableTransport for WebTunnelTransport {
                                             }
                                             Ok(())
                                         }
-                                    );
+                                    ) {
+                                        tracing::debug!(%e, "webtunnel client: copy loop ended");
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!(%e, "webtunnel: WebSocket connect failed");
@@ -140,7 +143,7 @@ impl PluggableTransport for WebTunnelTransport {
                                             let (mut tcp_read, mut tcp_write) =
                                                 tokio::io::split(tcp_out);
 
-                                            let _ = tokio::try_join!(
+                                            if let Err(e) = tokio::try_join!(
                                                 async {
                                                     while let Some(Ok(msg)) =
                                                         ws_read.next().await
@@ -172,7 +175,9 @@ impl PluggableTransport for WebTunnelTransport {
                                                         }
                                                     }
                                                 }
-                                            );
+                                            ) {
+                                                tracing::debug!(%e, "webtunnel server: copy loop ended");
+                                            }
                                         }
                                         Err(e) => {
                                             tracing::error!(
@@ -203,6 +208,7 @@ impl PluggableTransport for WebTunnelTransport {
 }
 
 /// Obfuscation layer that wraps a raw stream inside a WebSocket connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebTunnelObfuscator {
     /// WebSocket endpoint URL to connect to.
     pub ws_url: String,
@@ -447,5 +453,27 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = wrapped.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn webtunnel_transport_clone_eq() {
+        let t1 = WebTunnelTransport::new();
+        let t2 = t1;
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn webtunnel_transport_default() {
+        let t = WebTunnelTransport::default();
+        assert_eq!(t, WebTunnelTransport::new());
+    }
+
+    #[test]
+    fn webtunnel_obfuscator_clone_eq() {
+        let o1 = WebTunnelObfuscator {
+            ws_url: "ws://127.0.0.1:8080/tunnel".into(),
+        };
+        let o2 = o1.clone();
+        assert_eq!(o1, o2);
     }
 }
