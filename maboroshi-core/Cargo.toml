@@ -1,0 +1,20 @@
+[package]
+name = "maboroshi-core"
+version = "0.1.0"
+description = "Core traits and types for the maboroshi pluggable transport framework"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["net", "io-util"] }
+tracing = "0.1"
