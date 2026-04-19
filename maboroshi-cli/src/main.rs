@@ -97,9 +97,9 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "client started"
             );
 
-            // Run until interrupted.
-            tokio::signal::ctrl_c().await?;
-            info!("shutting down");
+            // Run until drain signal (SIGTERM or SIGINT).
+            tsunagu::ShutdownController::install().token().wait().await;
+            info!("draining");
         }
 
         Command::Server {
@@ -126,9 +126,9 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "server started"
             );
 
-            // Run until interrupted.
-            tokio::signal::ctrl_c().await?;
-            info!("shutting down");
+            // Run until drain signal (SIGTERM or SIGINT).
+            tsunagu::ShutdownController::install().token().wait().await;
+            info!("draining");
         }
 
         Command::List => {
